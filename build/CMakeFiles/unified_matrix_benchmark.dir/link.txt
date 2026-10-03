@@ -1,0 +1,1 @@
+/usr/lib/nvidia-cuda-toolkit/bin/g++ @CMakeFiles/unified_matrix_benchmark.dir/objects1.rsp -o unified_matrix_benchmark @CMakeFiles/unified_matrix_benchmark.dir/linkLibs.rsp -L"/usr/lib/x86_64-linux-gnu/stubs" -L"/usr/lib/x86_64-linux-gnu"
