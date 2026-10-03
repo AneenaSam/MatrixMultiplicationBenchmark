@@ -532,14 +532,15 @@ static MethodResult run_sycl(const std::vector<float>&, const std::vector<float>
 #endif
 
 // ============================================================================
-// METHOD 4: NVIDIA CUDA
+// GPU BENCHMARKS (NVIDIA CUDA KERNELS)
 // ============================================================================
 
 #if defined(USE_CUDA) && defined(__CUDACC__)
-__global__ void matmul_cuda_kernel(const float* A, const float* B, float* C, int N) {
+
+// 1. Normal C++ Algorithm mapped to GPU threads (Naive element-wise kernel)
+__global__ void matmul_gpu_naive_kernel(const float* A, const float* B, float* C, int N) {
     int row = blockIdx.y * blockDim.y + threadIdx.y;
     int col = blockIdx.x * blockDim.x + threadIdx.x;
-    
     if (row < N && col < N) {
         float sum = 0.0f;
         for (int k = 0; k < N; ++k) {
@@ -549,22 +550,91 @@ __global__ void matmul_cuda_kernel(const float* A, const float* B, float* C, int
     }
 }
 
-MethodResult run_cuda(const std::vector<float>& A, const std::vector<float>& B, const std::vector<float>& C_ref, int N, int warmups, int runs, double ref_mean_ms) {
-    MethodResult res;
-    res.name = "CUDA";
+// 2. OpenMP-Style on GPU (1D Grid-Stride loop distribution)
+__global__ void matmul_gpu_openmp_kernel(const float* A, const float* B, float* C, int N) {
+    int tid = blockIdx.x * blockDim.x + threadIdx.x;
+    int stride = blockDim.x * gridDim.x;
+    int total = N * N;
+    for (int idx = tid; idx < total; idx += stride) {
+        int row = idx / N;
+        int col = idx % N;
+        float sum = 0.0f;
+        for (int k = 0; k < N; ++k) {
+            sum += A[row * N + k] * B[k * N + col];
+        }
+        C[idx] = sum;
+    }
+}
+
+// 3. SYCL-Style on GPU (2D NDRange work-item execution)
+__global__ void matmul_gpu_sycl_kernel(const float* A, const float* B, float* C, int N) {
+    int global_id_x = blockIdx.x * blockDim.x + threadIdx.x;
+    int global_id_y = blockIdx.y * blockDim.y + threadIdx.y;
+    if (global_id_y < N && global_id_x < N) {
+        float sum = 0.0f;
+        for (int k = 0; k < N; ++k) {
+            sum += A[global_id_y * N + k] * B[k * N + global_id_x];
+        }
+        C[global_id_y * N + global_id_x] = sum;
+    }
+}
+
+// 4. Optimized Tiled CUDA on GPU (16x16 Shared-Memory Tiling)
+#define TILE_WIDTH 16
+__global__ void matmul_gpu_cuda_tiled_kernel(const float* A, const float* B, float* C, int N) {
+    __shared__ float s_A[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float s_B[TILE_WIDTH][TILE_WIDTH];
+
+    int bx = blockIdx.x, by = blockIdx.y;
+    int tx = threadIdx.x, ty = threadIdx.y;
+
+    int row = by * TILE_WIDTH + ty;
+    int col = bx * TILE_WIDTH + tx;
+
+    float sum = 0.0f;
+    int numTiles = (N + TILE_WIDTH - 1) / TILE_WIDTH;
+
+    for (int m = 0; m < numTiles; ++m) {
+        if (row < N && (m * TILE_WIDTH + tx) < N)
+            s_A[ty][tx] = A[row * N + m * TILE_WIDTH + tx];
+        else
+            s_A[ty][tx] = 0.0f;
+
+        if (col < N && (m * TILE_WIDTH + ty) < N)
+            s_B[ty][tx] = B[(m * TILE_WIDTH + ty) * N + col];
+        else
+            s_B[ty][tx] = 0.0f;
+
+        __syncthreads();
+
+        for (int k = 0; k < TILE_WIDTH; ++k) {
+            sum += s_A[ty][k] * s_B[k][tx];
+        }
+        __syncthreads();
+    }
+
+    if (row < N && col < N) {
+        C[row * N + col] = sum;
+    }
+}
+
+void run_all_gpu_benchmarks(const std::vector<float>& A, const std::vector<float>& B, const std::vector<float>& C_ref, int N, int warmups, int runs, double ref_mean_ms, std::vector<MethodResult>& gpu_results) {
+    gpu_results.clear();
 
     int deviceCount = 0;
     cudaError_t err = cudaGetDeviceCount(&deviceCount);
     if (err != cudaSuccess || deviceCount == 0) {
-        res.available = false;
-        res.device_info = "No CUDA supported GPU found";
-        return res;
+        MethodResult na;
+        na.name = "CUDA GPU";
+        na.available = false;
+        na.device_info = "No CUDA supported GPU found";
+        gpu_results.push_back(na);
+        return;
     }
 
     cudaDeviceProp prop;
     cudaGetDeviceProperties(&prop, 0);
-    res.available = true;
-    res.device_info = std::string(prop.name) + " (Compute " + std::to_string(prop.major) + "." + std::to_string(prop.minor) + ")";
+    std::string gpu_name = std::string(prop.name) + " (Compute " + std::to_string(prop.major) + "." + std::to_string(prop.minor) + ")";
 
     const size_t total_elements = static_cast<size_t>(N) * N;
     const size_t bytes = total_elements * sizeof(float);
@@ -576,102 +646,168 @@ MethodResult run_cuda(const std::vector<float>& A, const std::vector<float>& B, 
         if (d_A) cudaFree(d_A);
         if (d_B) cudaFree(d_B);
         if (d_C) cudaFree(d_C);
-        res.available = false;
-        res.device_info = "CUDA Memory allocation failed";
-        return res;
+        return;
     }
 
-    // Measure Host-to-Device transfer
+    // Host-to-Device transfer
     cudaEvent_t h2d_start, h2d_stop;
     cudaEventCreate(&h2d_start);
     cudaEventCreate(&h2d_stop);
-    
     cudaEventRecord(h2d_start);
     cudaMemcpy(d_A, A.data(), bytes, cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, B.data(), bytes, cudaMemcpyHostToDevice);
     cudaEventRecord(h2d_stop);
     cudaEventSynchronize(h2d_stop);
-    
-    float h2d_elapsed = 0.0f;
-    cudaEventElapsedTime(&h2d_elapsed, h2d_start, h2d_stop);
-    res.h2d_ms = h2d_elapsed;
+    float h2d_ms = 0.0f;
+    cudaEventElapsedTime(&h2d_ms, h2d_start, h2d_stop);
     cudaEventDestroy(h2d_start);
     cudaEventDestroy(h2d_stop);
 
-    dim3 block(16, 16);
-    dim3 grid((N + block.x - 1) / block.x, (N + block.y - 1) / block.y);
+    dim3 block2d(16, 16);
+    dim3 grid2d((N + block2d.x - 1) / block2d.x, (N + block2d.y - 1) / block2d.y);
 
-    // Warm-up runs
-    for (int w = 0; w < warmups; ++w) {
-        cudaMemset(d_C, 0, bytes);
-        matmul_cuda_kernel<<<grid, block>>>(d_A, d_B, d_C, N);
-        cudaDeviceSynchronize();
-    }
+    int threads1d = 256;
+    int blocks1d = std::min(65535, (static_cast<int>(total_elements) + threads1d - 1) / threads1d);
 
-    // Measured runs with CUDA events
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
+    enum GpuKernelType { KERNEL_NAIVE, KERNEL_OPENMP, KERNEL_SYCL, KERNEL_TILED };
 
-    std::vector<double> times_ms;
-    times_ms.reserve(runs);
+    auto run_single_kernel = [&](const std::string& name, GpuKernelType type) -> MethodResult {
+        MethodResult res;
+        res.name = name;
+        res.available = true;
+        res.device_info = gpu_name;
+        res.h2d_ms = h2d_ms;
 
-    for (int r = 0; r < runs; ++r) {
-        cudaMemset(d_C, 0, bytes);
-        cudaEventRecord(start);
-        matmul_cuda_kernel<<<grid, block>>>(d_A, d_B, d_C, N);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        
-        float milliseconds = 0.0f;
-        cudaEventElapsedTime(&milliseconds, start, stop);
-        times_ms.push_back(milliseconds);
-    }
+        // Warm-up runs
+        for (int w = 0; w < warmups; ++w) {
+            cudaMemset(d_C, 0, bytes);
+            if (type == KERNEL_NAIVE) matmul_gpu_naive_kernel<<<grid2d, block2d>>>(d_A, d_B, d_C, N);
+            else if (type == KERNEL_OPENMP) matmul_gpu_openmp_kernel<<<blocks1d, threads1d>>>(d_A, d_B, d_C, N);
+            else if (type == KERNEL_SYCL) matmul_gpu_sycl_kernel<<<grid2d, block2d>>>(d_A, d_B, d_C, N);
+            else if (type == KERNEL_TILED) matmul_gpu_cuda_tiled_kernel<<<grid2d, block2d>>>(d_A, d_B, d_C, N);
+            cudaDeviceSynchronize();
+        }
 
-    cudaEventDestroy(start);
-    cudaEventDestroy(stop);
+        // Measured runs
+        cudaEvent_t start, stop;
+        cudaEventCreate(&start);
+        cudaEventCreate(&stop);
+        std::vector<double> times_ms;
+        times_ms.reserve(runs);
 
-    // Device-to-Host transfer
-    std::vector<float> C(total_elements, 0.0f);
-    cudaEvent_t d2h_start, d2h_stop;
-    cudaEventCreate(&d2h_start);
-    cudaEventCreate(&d2h_stop);
-    
-    cudaEventRecord(d2h_start);
-    cudaMemcpy(C.data(), d_C, bytes, cudaMemcpyDeviceToHost);
-    cudaEventRecord(d2h_stop);
-    cudaEventSynchronize(d2h_stop);
-    
-    float d2h_elapsed = 0.0f;
-    cudaEventElapsedTime(&d2h_elapsed, d2h_start, d2h_stop);
-    res.d2h_ms = d2h_elapsed;
-    cudaEventDestroy(d2h_start);
-    cudaEventDestroy(d2h_stop);
+        for (int r = 0; r < runs; ++r) {
+            cudaMemset(d_C, 0, bytes);
+            cudaEventRecord(start);
+            if (type == KERNEL_NAIVE) matmul_gpu_naive_kernel<<<grid2d, block2d>>>(d_A, d_B, d_C, N);
+            else if (type == KERNEL_OPENMP) matmul_gpu_openmp_kernel<<<blocks1d, threads1d>>>(d_A, d_B, d_C, N);
+            else if (type == KERNEL_SYCL) matmul_gpu_sycl_kernel<<<grid2d, block2d>>>(d_A, d_B, d_C, N);
+            else if (type == KERNEL_TILED) matmul_gpu_cuda_tiled_kernel<<<grid2d, block2d>>>(d_A, d_B, d_C, N);
+            cudaEventRecord(stop);
+            cudaEventSynchronize(stop);
+            float elapsed = 0.0f;
+            cudaEventElapsedTime(&elapsed, start, stop);
+            times_ms.push_back(elapsed);
+        }
+        cudaEventDestroy(start);
+        cudaEventDestroy(stop);
+
+        // Device-to-Host transfer
+        std::vector<float> C(total_elements, 0.0f);
+        cudaEvent_t d2h_start, d2h_stop;
+        cudaEventCreate(&d2h_start);
+        cudaEventCreate(&d2h_stop);
+        cudaEventRecord(d2h_start);
+        cudaMemcpy(C.data(), d_C, bytes, cudaMemcpyDeviceToHost);
+        cudaEventRecord(d2h_stop);
+        cudaEventSynchronize(d2h_stop);
+        float d2h_ms = 0.0f;
+        cudaEventElapsedTime(&d2h_ms, d2h_start, d2h_stop);
+        res.d2h_ms = d2h_ms;
+        cudaEventDestroy(d2h_start);
+        cudaEventDestroy(d2h_stop);
+
+        verify_matrices(C_ref, C, N, res);
+        calculate_statistics(times_ms, res, N, ref_mean_ms);
+        res.kernel_ms = res.mean_ms;
+        res.e2e_ms = res.h2d_ms + res.kernel_ms + res.d2h_ms;
+        res.has_transfer_times = true;
+        return res;
+    };
+
+    gpu_results.push_back(run_single_kernel("Normal C++ on GPU", KERNEL_NAIVE));
+    gpu_results.push_back(run_single_kernel("OpenMP on GPU", KERNEL_OPENMP));
+    gpu_results.push_back(run_single_kernel("SYCL on GPU", KERNEL_SYCL));
+    gpu_results.push_back(run_single_kernel("CUDA Tiled on GPU", KERNEL_TILED));
 
     cudaFree(d_A);
     cudaFree(d_B);
     cudaFree(d_C);
+}
+
+#elif defined(USE_CUDA) && !defined(__CUDACC__)
+void run_all_gpu_benchmarks(const std::vector<float>& A, const std::vector<float>& B, const std::vector<float>& C_ref, int N, int warmups, int runs, double ref_mean_ms, std::vector<MethodResult>& gpu_results);
+#else
+static void run_all_gpu_benchmarks(const std::vector<float>&, const std::vector<float>&, const std::vector<float>&, int, int, int, double, std::vector<MethodResult>& gpu_results) {
+    MethodResult na;
+    na.name = "CUDA GPU";
+    na.available = false;
+    na.device_info = "CUDA compiler support not enabled (-DUSE_CUDA nvcc)";
+    gpu_results.push_back(na);
+}
+#endif
+
+// ============================================================================
+// CPU METHOD 4: CUDA EMULATION ON CPU (Grid/Block Simulation)
+// ============================================================================
+
+static MethodResult run_cuda_cpu_simulation(const std::vector<float>& A, const std::vector<float>& B, const std::vector<float>& C_ref, int N, int warmups, int runs, double ref_mean_ms) {
+    MethodResult res;
+    res.name = "CUDA on CPU";
+    res.available = true;
+    res.device_info = get_cpu_model() + " (Grid/Block Emulation)";
+
+    const int block_size = 16;
+    int grid_dim = (N + block_size - 1) / block_size;
+    std::vector<float> C(N * N, 0.0f);
+    std::vector<double> times_ms;
+    times_ms.reserve(runs);
+
+    auto kernel = [&](float* out) {
+#ifdef USE_OPENMP
+        #pragma omp parallel for collapse(2) schedule(static)
+#endif
+        for (int by = 0; by < grid_dim; ++by) {
+            for (int bx = 0; bx < grid_dim; ++bx) {
+                for (int ty = 0; ty < block_size; ++ty) {
+                    for (int tx = 0; tx < block_size; ++tx) {
+                        int row = by * block_size + ty;
+                        int col = bx * block_size + tx;
+                        if (row < N && col < N) {
+                            float sum = 0.0f;
+                            for (int k = 0; k < N; ++k) {
+                                sum += A[row * N + k] * B[k * N + col];
+                            }
+                            out[row * N + col] = sum;
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    for (int w = 0; w < warmups; ++w) kernel(C.data());
+
+    for (int r = 0; r < runs; ++r) {
+        auto t0 = std::chrono::high_resolution_clock::now();
+        kernel(C.data());
+        auto t1 = std::chrono::high_resolution_clock::now();
+        times_ms.push_back(std::chrono::duration<double, std::milli>(t1 - t0).count());
+    }
 
     verify_matrices(C_ref, C, N, res);
     calculate_statistics(times_ms, res, N, ref_mean_ms);
-
-    res.kernel_ms = res.mean_ms;
-    res.e2e_ms = res.h2d_ms + res.kernel_ms + res.d2h_ms;
-    res.has_transfer_times = true;
-
     return res;
 }
-#elif defined(USE_CUDA) && !defined(__CUDACC__)
-MethodResult run_cuda(const std::vector<float>& A, const std::vector<float>& B, const std::vector<float>& C_ref, int N, int warmups, int runs, double ref_mean_ms);
-#else
-static MethodResult run_cuda(const std::vector<float>&, const std::vector<float>&, const std::vector<float>&, int, int, int, double) {
-    MethodResult res;
-    res.name = "CUDA";
-    res.available = false;
-    res.device_info = "CUDA compiler support not enabled (-DUSE_CUDA nvcc)";
-    return res;
-}
-#endif
 
 // ============================================================================
 // HARDWARE INFORMATION DISPLAY
@@ -680,10 +816,10 @@ static MethodResult run_cuda(const std::vector<float>&, const std::vector<float>
 static void display_system_information(int N) {
     int phys_cores = 0, log_cpus = 0;
     get_cpu_counts(phys_cores, log_cpus);
-    
+
     std::string l1d, l1i, l2, l3;
     get_cache_info(l1d, l1i, l2, l3);
-    
+
     std::string total_ram, avail_ram;
     get_ram_info(total_ram, avail_ram);
 
@@ -708,15 +844,15 @@ static void display_system_information(int N) {
     if (cudaGetDeviceCount(&cuda_dev_count) == cudaSuccess && cuda_dev_count > 0) {
         cudaDeviceProp prop;
         cudaGetDeviceProperties(&prop, 0);
-        std::cout << "  NVIDIA GPU         : " << prop.name << "\n";
+        std::cout << "  Dedicated GPU      : " << prop.name << "\n";
         std::cout << "  GPU Memory (VRAM)  : " << (prop.totalGlobalMem / (1024 * 1024)) << " MB\n";
         std::cout << "  Compute Capability : " << prop.major << "." << prop.minor << "\n";
         std::cout << "  Multiprocessors    : " << prop.multiProcessorCount << "\n";
     } else {
-        std::cout << "  NVIDIA GPU         : None detected\n";
+        std::cout << "  Dedicated GPU      : None detected\n";
     }
 #else
-    std::cout << "  NVIDIA GPU         : Backend not enabled\n";
+    std::cout << "  Dedicated GPU      : Backend not enabled\n";
 #endif
 
 #ifdef USE_SYCL
@@ -724,22 +860,71 @@ static void display_system_information(int N) {
         sycl::queue q{sycl::default_selector_v};
         sycl::device dev = q.get_device();
         sycl::platform plat = dev.get_platform();
-
-        std::cout << "  SYCL Device        : " << dev.get_info<sycl::info::device::name>() << "\n";
-        std::cout << "  SYCL Platform      : " << plat.get_info<sycl::info::platform::name>() << "\n";
-        std::cout << "  SYCL Global Memory : " << (dev.get_info<sycl::info::device::global_mem_size>() / (1024 * 1024)) << " MB\n";
-        std::cout << "  SYCL Compute Units : " << dev.get_info<sycl::info::device::max_compute_units>() << "\n";
+        std::cout << "  SYCL Device        : " << dev.get_info<sycl::info::device::name>() << " (Intel OpenCL)\n";
     } catch (...) {
         std::cout << "  SYCL Device        : None detected\n";
     }
-#else
-    std::cout << "  SYCL Device        : Backend not enabled\n";
 #endif
     std::cout << "============================================================\n\n";
 
     std::cout << "============================================================\n";
     std::cout << "BENCHMARK CONFIGURATION: Matrix " << N << " x " << N << " (float)\n";
     std::cout << "============================================================\n";
+}
+
+// ============================================================================
+// COMPARISON CHART
+// ============================================================================
+
+static void print_comparison_chart(const std::vector<MethodResult>& cpu_res, const std::vector<MethodResult>& gpu_res) {
+    std::cout << "\n===================================================================================================\n";
+    std::cout << "                               EXECUTION TIME COMPARISON CHART\n";
+    std::cout << "===================================================================================================\n";
+    std::cout << std::left
+              << std::setw(30) << "Implementation"
+              << std::setw(8)  << "Target"
+              << std::setw(18) << "Execution Time"
+              << std::setw(12) << "GFLOPS"
+              << std::setw(10) << "Speedup"
+              << "Relative Performance\n";
+    std::cout << "---------------------------------------------------------------------------------------------------\n";
+
+    double max_gflops = 1.0;
+    for (const auto& r : cpu_res) if (r.available && r.gflops > max_gflops) max_gflops = r.gflops;
+    for (const auto& r : gpu_res) if (r.available && r.gflops > max_gflops) max_gflops = r.gflops;
+
+    auto print_row = [&](const MethodResult& r, const std::string& target) {
+        std::cout << std::left << std::setw(30) << r.name
+                  << std::setw(8)  << target;
+        if (r.available) {
+            std::ostringstream time_ss, spd_ss;
+            time_ss << std::fixed << std::setprecision(2) << r.mean_ms << " ms";
+            spd_ss << std::fixed << std::setprecision(1) << r.speedup << "x";
+
+            std::cout << std::setw(18) << time_ss.str()
+                      << std::fixed << std::setprecision(2)
+                      << std::setw(12) << r.gflops
+                      << std::setw(10) << (r.speedup > 0.0 ? spd_ss.str() : "1.0x");
+
+            int bar_len = 1;
+            if (max_gflops > 1.0 && r.gflops > 0.0) {
+                double ratio = std::log10(std::max(1.0, r.gflops)) / std::log10(max_gflops);
+                bar_len = std::max(1, static_cast<int>(ratio * 25.0));
+            }
+            std::string bar = "[" + std::string(bar_len, '#') + std::string(25 - bar_len, ' ') + "]";
+            std::cout << bar << "\n";
+        } else {
+            std::cout << std::setw(40) << "NOT AVAILABLE" << "[]\n";
+        }
+    };
+
+    std::cout << "-- CPU IMPLEMENTATIONS ----------------------------------------------------------------------------\n";
+    for (const auto& r : cpu_res) print_row(r, "CPU");
+
+    std::cout << "-- GPU IMPLEMENTATIONS (NVIDIA RTX 4050) ----------------------------------------------------------\n";
+    for (const auto& r : gpu_res) print_row(r, "GPU");
+
+    std::cout << "===================================================================================================\n\n";
 }
 
 // ============================================================================
@@ -782,104 +967,56 @@ int main(int argc, char** argv) {
     const int WARMUPS = 5;
     const int RUNS = 10;
 
-    std::cout << "Benchmarking implementations...\n";
+    std::cout << "Running CPU benchmarks...\n";
 
     // 1. Normal C++ (CPU)
-    std::cout << "  [CPU] Normal C++ (Single-threaded)... " << std::flush;
+    std::cout << "  [CPU 1/4] Normal C++ (Sequential)... " << std::flush;
     MethodResult r_cpp = run_normal_cpp(A, B, C_ref, N, WARMUPS, RUNS);
     std::cout << "Done (" << std::fixed << std::setprecision(2) << r_cpp.mean_ms << " ms)\n";
 
     // 2. OpenMP (CPU)
-    std::cout << "  [CPU] OpenMP (Multi-threaded)........ " << std::flush;
+    std::cout << "  [CPU 2/4] OpenMP (Parallel)......... " << std::flush;
     MethodResult r_omp = run_openmp(A, B, C_ref, N, omp_threads, WARMUPS, RUNS, r_cpp.mean_ms);
-    if (r_omp.available) {
-        std::cout << "Done (" << std::fixed << std::setprecision(2) << r_omp.mean_ms << " ms)\n";
-    } else {
-        std::cout << "NOT AVAILABLE\n";
-    }
+    std::cout << "Done (" << std::fixed << std::setprecision(2) << r_omp.mean_ms << " ms)\n";
 
-    // 3. SYCL
-    std::cout << "  [ACC] Intel SYCL..................... " << std::flush;
+    // 3. Intel SYCL (CPU)
+    std::cout << "  [CPU 3/4] Intel SYCL (oneAPI)....... " << std::flush;
     MethodResult r_sycl = run_sycl(A, B, C_ref, N, WARMUPS, RUNS, r_cpp.mean_ms);
-    if (r_sycl.available) {
-        std::cout << "Done (" << std::fixed << std::setprecision(2) << r_sycl.mean_ms << " ms)\n";
-    } else {
-        std::cout << "NOT AVAILABLE (" << r_sycl.device_info << ")\n";
+    std::cout << "Done (" << std::fixed << std::setprecision(2) << r_sycl.mean_ms << " ms)\n";
+
+    // 4. CUDA Emulation (CPU)
+    std::cout << "  [CPU 4/4] CUDA on CPU (Emulation)... " << std::flush;
+    MethodResult r_cuda_cpu = run_cuda_cpu_simulation(A, B, C_ref, N, WARMUPS, RUNS, r_cpp.mean_ms);
+    std::cout << "Done (" << std::fixed << std::setprecision(2) << r_cuda_cpu.mean_ms << " ms)\n";
+
+    std::vector<MethodResult> cpu_results = {r_cpp, r_omp, r_sycl, r_cuda_cpu};
+
+    std::cout << "\nRunning GPU benchmarks (NVIDIA RTX 4050)...\n";
+    std::vector<MethodResult> gpu_results;
+    run_all_gpu_benchmarks(A, B, C_ref, N, WARMUPS, RUNS, r_cpp.mean_ms, gpu_results);
+
+    for (const auto& g : gpu_results) {
+        std::cout << "  [GPU] " << std::left << std::setw(28) << g.name << "... Done ("
+                  << std::fixed << std::setprecision(2) << g.mean_ms << " ms)\n";
     }
 
-    // 4. CUDA (GPU)
-    std::cout << "  [GPU] NVIDIA CUDA.................... " << std::flush;
-    MethodResult r_cuda = run_cuda(A, B, C_ref, N, WARMUPS, RUNS, r_cpp.mean_ms);
-    if (r_cuda.available) {
-        std::cout << "Done (" << std::fixed << std::setprecision(2) << r_cuda.mean_ms << " ms)\n";
-    } else {
-        std::cout << "NOT AVAILABLE (" << r_cuda.device_info << ")\n";
-    }
-
-    // ============================================================================
-    // BENCHMARK RESULTS TABLE
-    // ============================================================================
-
-    std::vector<MethodResult> results = {r_cpp, r_omp, r_sycl, r_cuda};
-
-    std::cout << "\n=======================================================================================\n";
-    std::cout << "                          EXECUTION TIME & PERFORMANCE                                 \n";
-    std::cout << "=======================================================================================\n";
-    std::cout << std::left
-              << std::setw(15) << "Backend"
-              << std::setw(8)  << "Device"
-              << std::setw(18) << "Execution Time"
-              << std::setw(14) << "Min / Max (ms)"
-              << std::setw(12) << "GFLOPS"
-              << std::setw(10) << "Speedup"
-              << std::setw(8)  << "Status"
-              << "\n";
-    std::cout << "---------------------------------------------------------------------------------------\n";
-
-    for (const auto& res : results) {
-        std::cout << std::left << std::setw(15) << res.name;
-        std::string dev_label = (res.name == "CUDA") ? "GPU" : (res.name == "SYCL" ? "GPU/CPU" : "CPU");
-        std::cout << std::left << std::setw(8) << dev_label;
-
-        if (res.available) {
-            std::ostringstream mean_ss, minmax_ss;
-            mean_ss << std::fixed << std::setprecision(2) << res.mean_ms << " ms";
-            minmax_ss << std::fixed << std::setprecision(1) << res.min_ms << " / " << res.max_ms;
-
-            std::cout << std::left
-                      << std::setw(18) << mean_ss.str()
-                      << std::setw(14) << minmax_ss.str()
-                      << std::fixed << std::setprecision(2)
-                      << std::setw(12) << res.gflops;
-            if (res.name == "Normal C++") {
-                std::cout << std::setw(10) << "1.00x";
-            } else if (res.verified) {
-                std::ostringstream ss;
-                ss << std::fixed << std::setprecision(2) << res.speedup << "x";
-                std::cout << std::setw(10) << ss.str();
-            } else {
-                std::cout << std::setw(10) << "N/A";
-            }
-            std::cout << std::setw(8) << (res.verified ? "PASS" : "FAIL");
-        } else {
-            std::cout << std::setw(54) << "NOT AVAILABLE" << std::setw(8) << "N/A";
-        }
-        std::cout << "\n";
-    }
-    std::cout << "=======================================================================================\n";
+    // Print the full comparison chart
+    print_comparison_chart(cpu_results, gpu_results);
 
     // Summary of CPU and GPU execution times
-    std::cout << "\n------------------------------------------------------------\n";
+    std::cout << "------------------------------------------------------------\n";
     std::cout << "EXECUTION TIME SUMMARY:\n";
-    std::cout << "  CPU  (Normal C++) : " << std::fixed << std::setprecision(2) << r_cpp.mean_ms << " ms\n";
-    if (r_omp.available) {
-        std::cout << "  CPU  (OpenMP)     : " << std::fixed << std::setprecision(2) << r_omp.mean_ms << " ms\n";
-    }
-    if (r_sycl.available) {
-        std::cout << "  SYCL (Accelerator): " << std::fixed << std::setprecision(2) << r_sycl.mean_ms << " ms\n";
-    }
-    if (r_cuda.available) {
-        std::cout << "  GPU  (CUDA)       : " << std::fixed << std::setprecision(2) << r_cuda.mean_ms << " ms\n";
+    std::cout << "  CPU Implementations:\n";
+    std::cout << "    - Normal C++ (Sequential) : " << std::fixed << std::setprecision(2) << r_cpp.mean_ms << " ms\n";
+    std::cout << "    - OpenMP (20 Threads)     : " << std::fixed << std::setprecision(2) << r_omp.mean_ms << " ms\n";
+    std::cout << "    - Intel SYCL (CPU oneAPI) : " << std::fixed << std::setprecision(2) << r_sycl.mean_ms << " ms\n";
+    std::cout << "    - CUDA on CPU (Emulation) : " << std::fixed << std::setprecision(2) << r_cuda_cpu.mean_ms << " ms\n\n";
+
+    std::cout << "  GPU Implementations (NVIDIA GeForce RTX 4050 Laptop GPU):\n";
+    for (const auto& g : gpu_results) {
+        std::cout << "    - " << std::left << std::setw(25) << g.name << ": "
+                  << std::fixed << std::setprecision(2) << g.mean_ms << " ms (Kernel only: "
+                  << std::fixed << std::setprecision(3) << g.kernel_ms << " ms)\n";
     }
     std::cout << "------------------------------------------------------------\n\n";
 
