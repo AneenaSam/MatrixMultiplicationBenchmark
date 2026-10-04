@@ -36,5 +36,5 @@ icpx -O3 -std=c++17 -fsycl -DUSE_SYCL -DUSE_OPENMP -DUSE_CUDA -qopenmp \
 
 echo "==========================================================="
 echo " Build successful! Executable: ./unified_matrix_benchmark"
-echo " Run with: ./run_benchmark.sh [matrix_size] [omp_threads]"
+echo " Run with: ./run_benchmark.sh [matrix_size] [omp_threads] [--only <sycl|cuda|openmp|cpu|gpu|all>]"
 echo "==========================================================="

@@ -15,6 +15,7 @@
 #include <cmath>
 #include <thread>
 #include <cstring>
+#include <cctype>
 #include <numeric>
 #include <set>
 
@@ -872,7 +873,7 @@ static void display_system_information(int N) {
     std::cout << "============================================================\n";
 }
 
-// ============================================================================
+/// ============================================================================
 // COMPARISON CHART
 // ============================================================================
 
@@ -894,35 +895,36 @@ static void print_comparison_chart(const std::vector<MethodResult>& cpu_res, con
     for (const auto& r : gpu_res) if (r.available && r.gflops > max_gflops) max_gflops = r.gflops;
 
     auto print_row = [&](const MethodResult& r, const std::string& target) {
+        if (!r.available) return;
         std::cout << std::left << std::setw(30) << r.name
                   << std::setw(8)  << target;
-        if (r.available) {
-            std::ostringstream time_ss, spd_ss;
-            time_ss << std::fixed << std::setprecision(2) << r.mean_ms << " ms";
-            spd_ss << std::fixed << std::setprecision(1) << r.speedup << "x";
+        std::ostringstream time_ss, spd_ss;
+        time_ss << std::fixed << std::setprecision(2) << r.mean_ms << " ms";
+        spd_ss << std::fixed << std::setprecision(1) << r.speedup << "x";
 
-            std::cout << std::setw(18) << time_ss.str()
-                      << std::fixed << std::setprecision(2)
-                      << std::setw(12) << r.gflops
-                      << std::setw(10) << (r.speedup > 0.0 ? spd_ss.str() : "1.0x");
+        std::cout << std::setw(18) << time_ss.str()
+                  << std::fixed << std::setprecision(2)
+                  << std::setw(12) << r.gflops
+                  << std::setw(10) << (r.speedup > 0.0 ? spd_ss.str() : "1.0x");
 
-            int bar_len = 1;
-            if (max_gflops > 1.0 && r.gflops > 0.0) {
-                double ratio = std::log10(std::max(1.0, r.gflops)) / std::log10(max_gflops);
-                bar_len = std::max(1, static_cast<int>(ratio * 25.0));
-            }
-            std::string bar = "[" + std::string(bar_len, '#') + std::string(25 - bar_len, ' ') + "]";
-            std::cout << bar << "\n";
-        } else {
-            std::cout << std::setw(40) << "NOT AVAILABLE" << "[]\n";
+        int bar_len = 1;
+        if (max_gflops > 1.0 && r.gflops > 0.0) {
+            double ratio = std::log10(std::max(1.0, r.gflops)) / std::log10(max_gflops);
+            bar_len = std::max(1, static_cast<int>(ratio * 25.0));
         }
+        std::string bar = "[" + std::string(bar_len, '#') + std::string(25 - bar_len, ' ') + "]";
+        std::cout << bar << "\n";
     };
 
-    std::cout << "-- CPU IMPLEMENTATIONS ----------------------------------------------------------------------------\n";
-    for (const auto& r : cpu_res) print_row(r, "CPU");
+    if (!cpu_res.empty()) {
+        std::cout << "-- CPU IMPLEMENTATIONS ----------------------------------------------------------------------------\n";
+        for (const auto& r : cpu_res) print_row(r, "CPU");
+    }
 
-    std::cout << "-- GPU IMPLEMENTATIONS (NVIDIA RTX 4050) ----------------------------------------------------------\n";
-    for (const auto& r : gpu_res) print_row(r, "GPU");
+    if (!gpu_res.empty()) {
+        std::cout << "-- GPU IMPLEMENTATIONS (NVIDIA RTX 4050) ----------------------------------------------------------\n";
+        for (const auto& r : gpu_res) print_row(r, "GPU");
+    }
 
     std::cout << "===================================================================================================\n\n";
 }
@@ -932,31 +934,88 @@ static void print_comparison_chart(const std::vector<MethodResult>& cpu_res, con
 // ============================================================================
 
 static void print_usage(const char* prog) {
-    std::cout << "Usage: " << prog << " [matrix_size] [omp_threads]\n";
+    std::cout << "Usage: " << prog << " [matrix_size] [omp_threads] [--only <target>]\n";
     std::cout << "Options:\n";
-    std::cout << "  matrix_size : Dimension N for N x N matrix (e.g. 512, 1024). Default: 1024\n";
-    std::cout << "  omp_threads : Number of OpenMP threads to use. Default: max available\n";
-    std::cout << "  --help      : Display this help message\n";
+    std::cout << "  matrix_size   : Dimension N for N x N matrix (e.g. 512, 1024). Default: 1024\n";
+    std::cout << "  omp_threads   : Number of OpenMP threads to use. Default: max available\n";
+    std::cout << "  --only <tgt>  : Run only specific methods: sycl, cuda, openmp, cpu, gpu, all. Default: all\n";
+    std::cout << "  --help        : Display this help message\n";
 }
 
 #ifndef MATMUL_NO_MAIN
 int main(int argc, char** argv) {
     int N = 1024;
     int omp_threads = -1;
+    std::string only_target = "all";
+    int pos_idx = 0;
 
     for (int i = 1; i < argc; ++i) {
         std::string arg = argv[i];
         if (arg == "--help" || arg == "-h") {
             print_usage(argv[0]);
             return 0;
-        } else if (i == 1) {
-            int val = std::atoi(arg.c_str());
-            if (val > 0) N = val;
-        } else if (i == 2) {
-            int val = std::atoi(arg.c_str());
-            if (val > 0) omp_threads = val;
+        } else if (arg == "--only") {
+            if (i + 1 < argc) {
+                only_target = argv[++i];
+            } else {
+                std::cerr << "[ERROR] --only requires an argument: <sycl|cuda|openmp|cpu|gpu|all>\n";
+                print_usage(argv[0]);
+                return 1;
+            }
+        } else if (arg.rfind("--only=", 0) == 0) {
+            only_target = arg.substr(7);
+        } else if (!arg.empty() && arg[0] == '-') {
+            std::cerr << "[ERROR] Unknown option: " << arg << "\n";
+            print_usage(argv[0]);
+            return 1;
+        } else {
+            if (pos_idx == 0) {
+                int val = std::atoi(arg.c_str());
+                if (val > 0) N = val;
+                pos_idx++;
+            } else if (pos_idx == 1) {
+                int val = std::atoi(arg.c_str());
+                if (val > 0) omp_threads = val;
+                pos_idx++;
+            }
         }
     }
+
+    std::transform(only_target.begin(), only_target.end(), only_target.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+
+    if (only_target != "all" && only_target != "sycl" && only_target != "cuda" &&
+        only_target != "openmp" && only_target != "cpu" && only_target != "gpu") {
+        std::cerr << "[ERROR] Invalid target for --only: '" << only_target << "'\n";
+        std::cerr << "Supported options: sycl, cuda, openmp, cpu, gpu, all\n";
+        print_usage(argv[0]);
+        return 1;
+    }
+
+    // Backend availability check
+    if (only_target == "sycl") {
+#ifndef USE_SYCL
+        std::cerr << "[ERROR] Intel SYCL backend was not compiled in (-DUSE_SYCL).\n";
+        return 1;
+#endif
+    } else if (only_target == "cuda" || only_target == "gpu") {
+#ifndef USE_CUDA
+        std::cerr << "[ERROR] NVIDIA CUDA backend was not compiled in (-DUSE_CUDA).\n";
+        return 1;
+#endif
+    } else if (only_target == "openmp") {
+#ifndef USE_OPENMP
+        std::cerr << "[ERROR] OpenMP backend was not compiled in (-DUSE_OPENMP).\n";
+        return 1;
+#endif
+    }
+
+    bool run_cpp = (only_target == "all" || only_target == "cpu");
+    bool run_omp = (only_target == "all" || only_target == "cpu" || only_target == "openmp");
+    bool run_sycl_bench = (only_target == "all" || only_target == "cpu" || only_target == "sycl");
+    bool run_cuda_cpu = (only_target == "all" || only_target == "cpu");
+    bool run_gpu = (only_target == "all" || only_target == "gpu" || only_target == "cuda");
 
     display_system_information(N);
 
@@ -967,56 +1026,102 @@ int main(int argc, char** argv) {
     const int WARMUPS = 5;
     const int RUNS = 10;
 
-    std::cout << "Running CPU benchmarks...\n";
+    std::vector<MethodResult> cpu_results;
 
-    // 1. Normal C++ (CPU)
-    std::cout << "  [CPU 1/4] Normal C++ (Sequential)... " << std::flush;
-    MethodResult r_cpp = run_normal_cpp(A, B, C_ref, N, WARMUPS, RUNS);
-    std::cout << "Done (" << std::fixed << std::setprecision(2) << r_cpp.mean_ms << " ms)\n";
-
-    // 2. OpenMP (CPU)
-    std::cout << "  [CPU 2/4] OpenMP (Parallel)......... " << std::flush;
-    MethodResult r_omp = run_openmp(A, B, C_ref, N, omp_threads, WARMUPS, RUNS, r_cpp.mean_ms);
-    std::cout << "Done (" << std::fixed << std::setprecision(2) << r_omp.mean_ms << " ms)\n";
-
-    // 3. Intel SYCL (CPU)
-    std::cout << "  [CPU 3/4] Intel SYCL (oneAPI)....... " << std::flush;
-    MethodResult r_sycl = run_sycl(A, B, C_ref, N, WARMUPS, RUNS, r_cpp.mean_ms);
-    std::cout << "Done (" << std::fixed << std::setprecision(2) << r_sycl.mean_ms << " ms)\n";
-
-    // 4. CUDA Emulation (CPU)
-    std::cout << "  [CPU 4/4] CUDA on CPU (Emulation)... " << std::flush;
-    MethodResult r_cuda_cpu = run_cuda_cpu_simulation(A, B, C_ref, N, WARMUPS, RUNS, r_cpp.mean_ms);
-    std::cout << "Done (" << std::fixed << std::setprecision(2) << r_cuda_cpu.mean_ms << " ms)\n";
-
-    std::vector<MethodResult> cpu_results = {r_cpp, r_omp, r_sycl, r_cuda_cpu};
-
-    std::cout << "\nRunning GPU benchmarks (NVIDIA RTX 4050)...\n";
-    std::vector<MethodResult> gpu_results;
-    run_all_gpu_benchmarks(A, B, C_ref, N, WARMUPS, RUNS, r_cpp.mean_ms, gpu_results);
-
-    for (const auto& g : gpu_results) {
-        std::cout << "  [GPU] " << std::left << std::setw(28) << g.name << "... Done ("
-                  << std::fixed << std::setprecision(2) << g.mean_ms << " ms)\n";
+    // Normal C++ reference baseline (always runs first for C_ref and baseline timing)
+    MethodResult r_cpp;
+    if (run_cpp) {
+        std::cout << "Running CPU benchmarks...\n";
+        std::cout << "  [CPU 1/4] Normal C++ (Sequential)... " << std::flush;
+        r_cpp = run_normal_cpp(A, B, C_ref, N, WARMUPS, RUNS);
+        std::cout << "Done (" << std::fixed << std::setprecision(2) << r_cpp.mean_ms << " ms)\n";
+        cpu_results.push_back(r_cpp);
+    } else {
+        std::cout << "Running reference baseline (Normal C++ Sequential)... " << std::flush;
+        r_cpp = run_normal_cpp(A, B, C_ref, N, WARMUPS, RUNS);
+        std::cout << "Done (" << std::fixed << std::setprecision(2) << r_cpp.mean_ms << " ms)\n\n";
     }
 
-    // Print the full comparison chart
+    if (run_omp || run_sycl_bench || run_cuda_cpu) {
+        if (!run_cpp) {
+            std::cout << "Running CPU benchmarks...\n";
+        }
+
+        // OpenMP
+        if (run_omp) {
+#ifdef USE_OPENMP
+            std::cout << (only_target == "all" ? "  [CPU 2/4] " : "  [CPU] ")
+                      << "OpenMP (Parallel)......... " << std::flush;
+            MethodResult r_omp = run_openmp(A, B, C_ref, N, omp_threads, WARMUPS, RUNS, r_cpp.mean_ms);
+            std::cout << "Done (" << std::fixed << std::setprecision(2) << r_omp.mean_ms << " ms)\n";
+            if (r_omp.available) cpu_results.push_back(r_omp);
+#endif
+        }
+
+        // Intel SYCL
+        if (run_sycl_bench) {
+#ifdef USE_SYCL
+            std::cout << (only_target == "all" ? "  [CPU 3/4] " : "  [CPU] ")
+                      << "Intel SYCL (oneAPI)....... " << std::flush;
+            MethodResult r_sycl = run_sycl(A, B, C_ref, N, WARMUPS, RUNS, r_cpp.mean_ms);
+            std::cout << "Done (" << std::fixed << std::setprecision(2) << r_sycl.mean_ms << " ms)\n";
+            if (r_sycl.available) cpu_results.push_back(r_sycl);
+#endif
+        }
+
+        // CUDA Emulation on CPU
+        if (run_cuda_cpu) {
+#ifdef USE_OPENMP
+            std::cout << (only_target == "all" ? "  [CPU 4/4] " : "  [CPU] ")
+                      << "CUDA on CPU (Emulation)... " << std::flush;
+            MethodResult r_cuda_cpu = run_cuda_cpu_simulation(A, B, C_ref, N, WARMUPS, RUNS, r_cpp.mean_ms);
+            std::cout << "Done (" << std::fixed << std::setprecision(2) << r_cuda_cpu.mean_ms << " ms)\n";
+            if (r_cuda_cpu.available) cpu_results.push_back(r_cuda_cpu);
+#endif
+        }
+    }
+
+    std::vector<MethodResult> gpu_results;
+    if (run_gpu) {
+#ifdef USE_CUDA
+        std::cout << "\nRunning GPU benchmarks (NVIDIA RTX 4050)...\n";
+        run_all_gpu_benchmarks(A, B, C_ref, N, WARMUPS, RUNS, r_cpp.mean_ms, gpu_results);
+
+        for (const auto& g : gpu_results) {
+            if (g.available) {
+                std::cout << "  [GPU] " << std::left << std::setw(28) << g.name << "... Done ("
+                          << std::fixed << std::setprecision(2) << g.mean_ms << " ms)\n";
+            }
+        }
+#endif
+    }
+
+    // Print the comparison chart (only ran implementations will be shown)
     print_comparison_chart(cpu_results, gpu_results);
 
-    // Summary of CPU and GPU execution times
+    // Summary of execution times
     std::cout << "------------------------------------------------------------\n";
     std::cout << "EXECUTION TIME SUMMARY:\n";
-    std::cout << "  CPU Implementations:\n";
-    std::cout << "    - Normal C++ (Sequential) : " << std::fixed << std::setprecision(2) << r_cpp.mean_ms << " ms\n";
-    std::cout << "    - OpenMP (20 Threads)     : " << std::fixed << std::setprecision(2) << r_omp.mean_ms << " ms\n";
-    std::cout << "    - Intel SYCL (CPU oneAPI) : " << std::fixed << std::setprecision(2) << r_sycl.mean_ms << " ms\n";
-    std::cout << "    - CUDA on CPU (Emulation) : " << std::fixed << std::setprecision(2) << r_cuda_cpu.mean_ms << " ms\n\n";
+    if (!cpu_results.empty()) {
+        std::cout << "  CPU Implementations:\n";
+        for (const auto& c : cpu_results) {
+            if (c.available) {
+                std::cout << "    - " << std::left << std::setw(25) << c.name << " : "
+                          << std::fixed << std::setprecision(2) << c.mean_ms << " ms\n";
+            }
+        }
+        std::cout << "\n";
+    }
 
-    std::cout << "  GPU Implementations (NVIDIA GeForce RTX 4050 Laptop GPU):\n";
-    for (const auto& g : gpu_results) {
-        std::cout << "    - " << std::left << std::setw(25) << g.name << ": "
-                  << std::fixed << std::setprecision(2) << g.mean_ms << " ms (Kernel only: "
-                  << std::fixed << std::setprecision(3) << g.kernel_ms << " ms)\n";
+    if (!gpu_results.empty()) {
+        std::cout << "  GPU Implementations (NVIDIA GeForce RTX 4050 Laptop GPU):\n";
+        for (const auto& g : gpu_results) {
+            if (g.available) {
+                std::cout << "    - " << std::left << std::setw(25) << g.name << ": "
+                          << std::fixed << std::setprecision(2) << g.mean_ms << " ms (Kernel only: "
+                          << std::fixed << std::setprecision(3) << g.kernel_ms << " ms)\n";
+            }
+        }
     }
     std::cout << "------------------------------------------------------------\n\n";
 

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # run_benchmark.sh — Unified Matrix Multiplication Benchmark launcher
 # Supports all 4 backends: Normal C++, OpenMP CPU, Intel SYCL, NVIDIA CUDA GPU
+# Usage: ./run_benchmark.sh [matrix_size] [omp_threads] [--only <sycl|cuda|openmp|cpu|gpu|all>]
 
 set -e
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
