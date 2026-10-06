@@ -1,1 +1,0 @@
-/opt/intel/oneapi/compiler/2026.1/bin/icpx  -fsycl -O3 -DNDEBUG -fiopenmp CMakeFiles/unified_matrix_benchmark.dir/unified_matrix_benchmark.cpp.o -o unified_matrix_benchmark  /usr/lib/x86_64-linux-gnu/libcudart.so /opt/intel/oneapi/compiler/2026.1/lib/libiomp5.so /usr/lib/x86_64-linux-gnu/libpthread.a 

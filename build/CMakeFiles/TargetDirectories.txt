@@ -1,3 +1,0 @@
-/mnt/c/Users/Aneena/OneDrive/Desktop/MatrixMultiplicationBenchmark/build/CMakeFiles/unified_matrix_benchmark.dir
-/mnt/c/Users/Aneena/OneDrive/Desktop/MatrixMultiplicationBenchmark/build/CMakeFiles/edit_cache.dir
-/mnt/c/Users/Aneena/OneDrive/Desktop/MatrixMultiplicationBenchmark/build/CMakeFiles/rebuild_cache.dir

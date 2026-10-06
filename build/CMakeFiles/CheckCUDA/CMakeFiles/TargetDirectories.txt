@@ -1,2 +1,0 @@
-/mnt/c/Users/Aneena/OneDrive/Desktop/MatrixMultiplicationBenchmark/build/CMakeFiles/CheckCUDA/CMakeFiles/edit_cache.dir
-/mnt/c/Users/Aneena/OneDrive/Desktop/MatrixMultiplicationBenchmark/build/CMakeFiles/CheckCUDA/CMakeFiles/rebuild_cache.dir

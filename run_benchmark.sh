@@ -34,13 +34,10 @@ SYCL_LIBS=""
 # Detect which binary to use (prioritizing 4-backend binary)
 # =========================================================
 FULL_BIN="${SCRIPT_DIR}/unified_matrix_benchmark"
-SYCL_BIN="${SCRIPT_DIR}/unified_sycl"
 STD_BIN="${SCRIPT_DIR}/build/unified_matrix_benchmark"
 
 if [[ -f "$FULL_BIN" ]]; then
     exec env LD_LIBRARY_PATH="${SYCL_LIBS}" "$FULL_BIN" "$@"
-elif [[ -f "$SYCL_BIN" ]]; then
-    exec env LD_LIBRARY_PATH="${SYCL_LIBS}" "$SYCL_BIN" "$@"
 elif [[ -f "$STD_BIN" ]]; then
     exec "$STD_BIN" "$@"
 else

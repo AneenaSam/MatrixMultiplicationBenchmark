@@ -1,0 +1,11 @@
+# Build outputs and directories
+build/
+build_sycl/
+
+# Intermediate object files
+*.o
+
+# Backup and temporary files
+*.backup
+*~
+*.swp

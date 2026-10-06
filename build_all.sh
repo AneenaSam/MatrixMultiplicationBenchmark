@@ -34,6 +34,10 @@ icpx -O3 -std=c++17 -fsycl -DUSE_SYCL -DUSE_OPENMP -DUSE_CUDA -qopenmp \
     -I/usr/local/cuda/include -L/usr/local/cuda/lib64 -lcudart \
     -o unified_matrix_benchmark
 
+# Clean up intermediate CUDA object file
+rm -f cuda_part.o
+
+
 echo "==========================================================="
 echo " Build successful! Executable: ./unified_matrix_benchmark"
 echo " Run with: ./run_benchmark.sh [matrix_size] [omp_threads] [--only <sycl|cuda|openmp|cpu|gpu|all>]"
